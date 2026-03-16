@@ -7,15 +7,31 @@ from pathlib import Path
 from typing import Literal, Optional, Type
 
 import numpy as np
-import open3d as o3d
 import torch
-from dn_splatter.scripts.align_depth import ColmapToAlignedMonoDepths
-from dn_splatter.scripts.normals_from_pretrain import (
-    NormalsFromPretrained,
-    normals_from_depths,
-)
 from natsort import natsorted
 from rich.console import Console
+
+# Lazy imports to avoid pulling in heavy deps (omnidata_tools, open3d) at plugin load time
+o3d = None
+ColmapToAlignedMonoDepths = None
+NormalsFromPretrained = None
+normals_from_depths = None
+
+def _ensure_lazy_imports():
+    global o3d, ColmapToAlignedMonoDepths, NormalsFromPretrained, normals_from_depths
+    if o3d is None:
+        import open3d as _o3d
+        o3d = _o3d
+    if ColmapToAlignedMonoDepths is None:
+        from dn_splatter.scripts.align_depth import ColmapToAlignedMonoDepths as _c
+        ColmapToAlignedMonoDepths = _c
+    if NormalsFromPretrained is None:
+        from dn_splatter.scripts.normals_from_pretrain import (
+            NormalsFromPretrained as _n,
+            normals_from_depths as _nd,
+        )
+        NormalsFromPretrained = _n
+        normals_from_depths = _nd
 
 from nerfstudio.cameras import camera_utils
 from nerfstudio.cameras.cameras import CAMERA_MODEL_TO_TYPE, Cameras
@@ -107,6 +123,7 @@ class CoolerMapDataParser(ColmapDataParser):
         return natsorted(glob.glob(f"{self.normal_save_dir}/*.png"))
 
     def _generate_dataparser_outputs(self, split: str = "train", **kwargs):
+        _ensure_lazy_imports()
         assert (
             self.config.data.exists()
         ), f"Data directory {self.config.data} does not exist."

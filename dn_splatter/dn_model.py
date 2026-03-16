@@ -30,9 +30,32 @@ try:
     from gsplat.rendering import rasterization
 except ImportError:
     print("Please install gsplat>=1.0.0")
-from gsplat import rasterize_gaussians
-from gsplat.cuda_legacy._torch_impl import quat_to_rotmat
-from gsplat.cuda_legacy._wrapper import num_sh_bases
+
+# Compat shims for gsplat >= 1.2 (cuda_legacy removed)
+try:
+    from gsplat import rasterize_gaussians
+except ImportError:
+    rasterize_gaussians = None  # unused in new gsplat path
+
+try:
+    from gsplat.cuda_legacy._torch_impl import quat_to_rotmat
+except ImportError:
+    def quat_to_rotmat(quat):
+        """Convert quaternion (w,x,y,z) to 3x3 rotation matrix."""
+        import torch
+        w, x, y, z = quat.unbind(-1)
+        R = torch.stack([
+            1 - 2*(y*y + z*z),  2*(x*y - w*z),      2*(x*z + w*y),
+            2*(x*y + w*z),      1 - 2*(x*x + z*z),   2*(y*z - w*x),
+            2*(x*z - w*y),      2*(y*z + w*x),        1 - 2*(x*x + y*y),
+        ], dim=-1).reshape(*quat.shape[:-1], 3, 3)
+        return R
+
+try:
+    from gsplat.cuda_legacy._wrapper import num_sh_bases
+except ImportError:
+    def num_sh_bases(degree: int) -> int:
+        return (degree + 1) ** 2
 from nerfstudio.cameras.camera_optimizers import CameraOptimizer, CameraOptimizerConfig
 from nerfstudio.cameras.cameras import Cameras
 from nerfstudio.data.scene_box import OrientedBox
@@ -85,6 +108,8 @@ class DNSplatterModelConfig(SplatfactoModelConfig):
     """Type of supervision for normals. Mono for monocular normals and depth for pseudo normals from depth maps."""
     normal_lambda: float = 0.1
     """Regularizer for normal loss"""
+    continue_cull_post_densification: bool = False
+    """Continue culling after densification (compat shim for older nerfstudio)"""
     use_sparse_loss: bool = False
     """Encourage opacities to be 0 or 1. From 'Neural volumes: Learning dynamic renderable volumes from images'."""
     sparse_lambda: float = 0.1
@@ -559,20 +584,27 @@ class DNSplatterModel(SplatfactoModel):
             # convert normals from world space to camera space
             normals = normals @ camera.camera_to_worlds.squeeze(0)[:3, :3]
 
-            xys = self.xys[0, ...].detach()
-
-            normals_im: Tensor = rasterize_gaussians(  # type: ignore
-                xys,
-                self.depths[0, ...],
-                self.radii,
-                self.conics[0, ...],
-                self.num_tiles_hit[0, ...],
-                normals,
-                torch.sigmoid(opacities_crop),
-                H,
-                W,
-                BLOCK_WIDTH,
+            # Re-rasterize with normals as colors (new gsplat API)
+            normals_render, _, _ = rasterization(
+                means=means_crop,
+                quats=quats_crop / quats_crop.norm(dim=-1, keepdim=True),
+                scales=torch.exp(scales_crop),
+                opacities=torch.sigmoid(opacities_crop).squeeze(-1),
+                colors=normals,
+                viewmats=viewmat,
+                Ks=K,
+                width=W,
+                height=H,
+                tile_size=BLOCK_WIDTH,
+                packed=False,
+                near_plane=0.01,
+                far_plane=1e10,
+                render_mode="RGB",
+                sh_degree=None,
+                sparse_grad=False,
+                rasterize_mode=self.config.rasterize_mode,
             )
+            normals_im: Tensor = normals_render.squeeze(0)
             # convert normals from [-1,1] to [0,1]
             normals_im = normals_im / normals_im.norm(dim=-1, keepdim=True)
             normals_im = (normals_im + 1) / 2
@@ -929,15 +961,23 @@ class DNSplatterModel(SplatfactoModel):
         self, training_callback_attributes: TrainingCallbackAttributes
     ) -> List[TrainingCallback]:
         cbs = []
+        # Compat: nerfstudio 1.1.5 step_cb takes optimizers arg; 1.1.3 does not
+        step_cb_args = []
+        import inspect
+        if 'optimizers' in inspect.signature(self.step_cb).parameters:
+            step_cb_args = [training_callback_attributes.optimizers]
         cbs.append(
             TrainingCallback(
-                [TrainingCallbackLocation.BEFORE_TRAIN_ITERATION], self.step_cb
+                [TrainingCallbackLocation.BEFORE_TRAIN_ITERATION],
+                self.step_cb,
+                args=step_cb_args,
             )
         )
-        # The order of these matters
+        # Compat: nerfstudio 1.1.5 renamed after_train -> step_post_backward
+        after_cb = getattr(self, 'step_post_backward', None) or getattr(self, 'after_train', None)
         cbs.append(
             TrainingCallback(
-                [TrainingCallbackLocation.AFTER_TRAIN_ITERATION], self.after_train
+                [TrainingCallbackLocation.AFTER_TRAIN_ITERATION], after_cb
             )
         )
         cbs.append(

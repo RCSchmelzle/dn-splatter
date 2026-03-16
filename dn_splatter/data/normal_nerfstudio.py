@@ -431,6 +431,8 @@ class NormalNerfstudio(Nerfstudio):
 
         # reinitialize metadata for dataparser_outputs
         metadata = {}
+        metadata["load_depths"] = self.config.load_depths
+        metadata["load_normals"] = self.config.load_normals
 
         if self.config.load_depths and len(depth_filenames) == 0:
             depth_filenames = self.get_depth_filepaths()
